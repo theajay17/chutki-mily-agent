@@ -1,0 +1,74 @@
+# .dockerignore for CHUTKI Mily Agent
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test files
+test-*.py
+*-test.py
+quick-test.py
+
+# Documentation
+*.md
+README.md
+
+# Git
+.git/
+.gitignore
+
+# Environment
+.env.example
+setup-*.ps1
+setup-*.cmd
+
+# Flutter/Dart (not needed for Python agent)
+.dart_tool/
+.flutter-plugins*
+.metadata
+android/
+ios/
+lib/
+assets/
+pubspec.*
+analysis_options.yaml
+
+# Build artifacts
+Dockerfile.backup
+railway-*.json
