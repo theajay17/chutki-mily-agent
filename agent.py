@@ -184,17 +184,23 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             if not text.strip():
                 return
             if item.role == "user":
-                log.info("Caller: %s", text)
+                log.info("🎤 Caller said: %s", text)
             elif item.role == "assistant":
-                log.info("Mily: %s", text)
+                log.info("🗣️ Mily responds: %s", text)
+                # Force audio generation log
+                log.info("🔊 Audio should be playing now...")
 
         @session.on("agent_state_changed")
         def _on_state(ev: agents.AgentStateChangedEvent):
-            log.info("Mily state: %s -> %s", ev.old_state, ev.new_state)
+            log.info("🤖 Mily state: %s -> %s", ev.old_state, ev.new_state)
+
+        @session.on("agent_speech_committed") 
+        def _on_speech_committed(ev):
+            log.info("🎵 Mily speech committed - audio track should be active")
 
         @session.on("error")
         def _on_err(ev: agents.ErrorEvent):
-            log.error("AgentSession error: %s", ev.error)
+            log.error("❌ AgentSession error: %s", ev.error)
 
         # Start the session
         log.info("=== [ENTRYPOINT] Starting AgentSession... ===")
