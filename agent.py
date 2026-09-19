@@ -121,41 +121,42 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         call_session = CallSession(firebase_uid=firebase_uid, display_name=display_name)
         agent = MilyAgent(call_session, instructions=prompt)
 
-        # Use stable working Gemini Live model
+        # Use correct Gemini Live real-time models (from official docs)
+        log.info("=== 🚀 Using REAL-TIME Gemini Live API ===")
+        
         try:
-            # Use confirmed working model for LiveKit Realtime
+            # Try Gemini 3.8 Live first (default for voice experiences)
             session = AgentSession(
                 llm=google.beta.realtime.RealtimeModel(
-                    model="gemini-2.0-flash-exp",  # Confirmed working model
+                    model="gemini-3.8-live",  # ✅ Correct model from docs
+                    voice="Aoede",  # Breezy female voice for Mily
+                    instructions=prompt,
+                    temperature=0.3,
+                ),
+                turn_detection="realtime_llm",
+                vad=silero.VAD.load(
+                    min_silence_duration=0.3,
+                    min_speech_duration=0.1,
+                ),
+            )
+            log.info("=== ✅ SUCCESS: Using Gemini 3.8 Live (Real-time Voice) ===")
+        except Exception as e:
+            log.warning("Gemini 3.8 Live failed, trying 2.5 Flash Live: %s", e)
+            # Fallback to Gemini 2.5 Flash Live
+            session = AgentSession(
+                llm=google.beta.realtime.RealtimeModel(
+                    model="gemini-2.5-flash-native-audio-preview-12-2025",  # ✅ Flagship Live API
                     voice="Aoede",
                     instructions=prompt,
                     temperature=0.3,
                 ),
-                turn_detection="realtime_llm", 
+                turn_detection="realtime_llm",
                 vad=silero.VAD.load(
                     min_silence_duration=0.3,
                     min_speech_duration=0.1,
                 ),
             )
-            log.info("=== ✅ Using Gemini 2.0 Flash Exp (Stable) ===")
-        except Exception as e:
-            log.warning("Gemini Live failed, using LLM + TTS fallback: %s", e)
-            # Fallback to regular LLM with Google TTS
-            session = AgentSession(
-                llm=google.llm.LLM(
-                    model="gemini-1.5-pro",  # Very stable model
-                    temperature=0.3,
-                ),
-                tts=google.tts.TTS(
-                    voice="en-US-Journey-D",  # Female voice for Mily
-                    language="en-US",  # Use English for better compatibility
-                ),
-                vad=silero.VAD.load(
-                    min_silence_duration=0.3,
-                    min_speech_duration=0.1,
-                ),
-            )
-            log.info("=== ✅ Using Gemini 1.5 Pro + Google TTS (Fallback) ==="))
+            log.info("=== ✅ SUCCESS: Using Gemini 2.5 Flash Live (Real-time Voice) ===")
 
         @session.on("conversation_item_added")
         def _on_item(ev: agents.ConversationItemAddedEvent):
