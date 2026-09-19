@@ -1,4 +1,4 @@
 # Core dependencies for Mily voice agent.
-livekit-agents[google,silero]>=1.0.20
-supabase>=2.15.0
-python-dotenv>=1.0.0
+livekit-agents[google]==1.8.2
+aiohttp==3.14.3
+python-dotenv==1.2.3

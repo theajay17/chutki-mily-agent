@@ -29,13 +29,13 @@ USER app
 
 # Expose port for Railway
 EXPOSE 8080
+ENV PORT=8080
 
 # Add health check endpoint
-RUN echo '#!/bin/bash\necho "Agent is running"\nexit 0' > /app/health.sh && chmod +x /app/health.sh
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD /app/health.sh
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/', timeout=5)"
 
 # Run the agent in production mode
 CMD ["python", "agent.py", "start"]
