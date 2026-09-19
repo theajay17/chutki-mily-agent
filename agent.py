@@ -121,12 +121,13 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         call_session = CallSession(firebase_uid=firebase_uid, display_name=display_name)
         agent = MilyAgent(call_session, instructions=prompt)
 
-        # Use working Gemini model - try without beta namespace first
+        # Use working Gemini model with better error handling
         try:
+            # Try RealtimeModel first (preferred for voice)
             session = AgentSession(
                 llm=google.beta.realtime.RealtimeModel(
                     model="gemini-2.0-flash-exp",
-                    voice="Aoede", 
+                    voice="Aoede",
                     instructions=prompt,
                     temperature=0.3,
                 ),
@@ -136,11 +137,19 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     min_speech_duration=0.1,
                 ),
             )
+            log.info("=== Using RealtimeModel for voice ===")
         except Exception as e:
-            log.warning("Failed to create RealtimeModel, falling back to regular LLM: %s", e)
-            # Fallback to regular Gemini LLM if RealtimeModel fails
+            log.warning("RealtimeModel failed, using regular LLM + TTS: %s", e)
+            # Fallback to regular LLM with TTS
             session = AgentSession(
-                llm=google.llm.LLM(model="gemini-2.0-flash-exp"),
+                llm=google.llm.LLM(
+                    model="gemini-1.5-flash",
+                    temperature=0.3,
+                ),
+                tts=google.tts.TTS(
+                    voice="en-US-Journey-D",  # Female voice
+                    language="hi",  # Hindi support
+                ),
                 vad=silero.VAD.load(
                     min_silence_duration=0.3,
                     min_speech_duration=0.1,
