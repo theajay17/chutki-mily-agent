@@ -68,7 +68,7 @@ def create_model() -> google.realtime.RealtimeModel:
     model = os.getenv('GEMINI_LIVE_MODEL', DEFAULT_MODEL)
     return google.realtime.RealtimeModel(
         model=model,
-        voice=os.getenv('GEMINI_LIVE_VOICE', 'Aoede'),
+        voice=os.getenv('GEMINI_LIVE_VOICE', 'Despina'),
         modalities=[types.Modality.AUDIO],
         thinking_config=(types.ThinkingConfig(thinking_level='minimal')
                          if model.startswith('gemini-3') else types.ThinkingConfig(thinking_budget=0)),
