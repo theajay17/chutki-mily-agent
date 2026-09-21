@@ -1,7 +1,14 @@
-"""Mily: full-duplex LiveKit audio with Gemini Live speech-to-speech."""
+"""Mily: LiveKit voice agent — Deepgram STT, Gemini LLM, Cartesia TTS.
+
+Replaces Gemini Live speech-to-speech. Gemini Live only offers prebuilt voices,
+which sound identical on every call by design; Cartesia lets Mily use a chosen
+or cloned voice. The tradeoff is three network hops instead of one, so the
+latency and turn-taking settings below matter more than they used to.
+"""
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import json
 import random
@@ -13,21 +20,34 @@ from google.genai import types
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentServer, AgentSession, room_io, function_tool
 from call_context import CallMemory, clock_context
-from livekit.plugins import google
+from livekit.plugins import cartesia, deepgram, google
 
 load_dotenv(Path(__file__).with_name('.env'))
 log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
-DEFAULT_MODEL = 'gemini-3.1-flash-live-preview'
-# Gemini Live prebuilt voices carry a personality label. Despina is labelled
-# "Smooth", which reads polished and announcer-like: wrong for a 21-year-old
-# friend on a casual call. Leda is labelled "Youthful".
-# Alternatives worth auditioning via GEMINI_LIVE_VOICE, with their labels:
-#   Sulafat (Warm), Zubenelgenubi (Casual), Achernar (Soft),
-#   Vindemiatrix (Gentle), Callirrhoe (Easy-going), Aoede (Breezy)
-# Full list of 30: docs.cloud.google.com/gemini-enterprise-agent-platform
-#                  /models/live-api/configure-language-voice
-DEFAULT_VOICE = 'Leda'
+# Text LLM for the pipeline. gemini-2.0-flash was shut down 2026-06-01.
+DEFAULT_LLM_MODEL = 'gemini-3.5-flash'
+
+# sonic-3 renders disfluencies written into the transcript ("hmm,", "uh,") with a
+# natural thinking pace. sonic-2 reads them flatly, which sounds robotic.
+DEFAULT_TTS_MODEL = 'sonic-3'
+
+# Cartesia voice. This is "Anika - System Facilitator" (language hi).
+# Heads-up for whoever tunes this next: Cartesia describes Anika as presenting
+# "information with composed clarity, ideal for facilitating" — she is built as a
+# support/IVR persona, not a friend. If calls still feel like customer service,
+# the voice is a likely cause. Better-fitting Hindi female voices on this
+# account, with Cartesia's own descriptions:
+#   Siya - Bright Conversationalist  4459a9a5-69d6-4680-b970-e13dc51845b6
+#   Meera - Bright Companion         a81fccdc-5595-4dfc-ae76-4de6a515b8a2
+#   Sneha - Empathetic Voice         6b02ffe5-e3cb-48c0-a023-c72f85953375
+#   Esha - Calm Guide                72656902-fb4b-4c31-af52-c3b68e2cae26
+# Override without touching code by setting CARTESIA_VOICE_ID.
+DEFAULT_VOICE_ID = '32b0f12b-67c3-421d-8850-b46c019ced91'
+
+# Anika is a Hindi-primary voice, so 'hi' is the right hint. If English words
+# inside Hinglish come out mispronounced, try CARTESIA_LANGUAGE=en and compare.
+DEFAULT_TTS_LANGUAGE = 'hi'
 
 # --- Per-call variation ------------------------------------------------------
 # Gemini 3.x ignores temperature / top_p / penalties, so sampling knobs cannot
@@ -129,6 +149,11 @@ def build_system_prompt(name: str, history: str = '', energy: str = '') -> str:
         "Never say 'main bhi chill kar rahi thi', 'tumhara intezaar kar rahi thi', or invent what you were "
         "doing before the call. Warmth comes from reacting to them, not a fabricated personal day. "
         "No markdown, emojis or spoken stage directions. "
+        "Your words go straight to a speech engine that takes its rhythm from your punctuation, "
+        "so write clean sentences: commas where you would breathe, and a full stop, question mark "
+        "or exclamation at the end of every sentence. "
+        "Use ordinary capitalisation. Never capitalise words for emphasis, because capitals get read "
+        "out as initials. Write numbers, times and amounts the normal way. "
         f"Caller display name (data): {name[:100]!r}. Context data:\n" + history
     )
 
@@ -154,24 +179,110 @@ class MilyCompanion(Agent):
 
 
 
-def create_model() -> google.realtime.RealtimeModel:
-    model = os.getenv('GEMINI_LIVE_MODEL', DEFAULT_MODEL)
-    return google.realtime.RealtimeModel(
-        model=model,
-        voice=os.getenv('GEMINI_LIVE_VOICE', DEFAULT_VOICE),
-        modalities=[types.Modality.AUDIO],
-        thinking_config=(types.ThinkingConfig(thinking_level='minimal')
-                         if model.startswith('gemini-3') else types.ThinkingConfig(thinking_budget=0)),
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=False, prefix_padding_ms=100,
-                # 300ms had Mily answering before the caller finished a thought,
-                # which is a large part of why calls did not feel like real calls.
-                silence_duration_ms=int(os.getenv('MILY_SILENCE_MS', '500')),
-            ),
-            activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-        ),
+def load_vad():
+    """Silero VAD, used for turn-taking and barge-in.
+
+    Gemini Live detected speech activity server-side. This pipeline has no
+    equivalent, so without VAD the session falls back to Deepgram's endpointing
+    alone and interruptions get clumsy. Loading is best-effort: a missing plugin
+    or a failed model download degrades turn-taking instead of killing calls.
+    """
+    try:
+        from livekit.plugins import silero
+    except ImportError:
+        log.warning('silero plugin missing; falling back to STT endpointing')
+        return None
+    try:
+        return silero.VAD.load()
+    except Exception as error:
+        log.warning('Silero VAD unavailable (%s); falling back to STT endpointing',
+                    type(error).__name__)
+        return None
+
+
+# Loaded once per worker process rather than per call: the model load is slow
+# enough to be noticeable on a first call.
+VAD = load_vad()
+
+
+def create_pipeline() -> dict:
+    """STT, LLM and TTS components for the AgentSession.
+
+    STT : Deepgram Nova-3, multilingual so Hindi/English/Hinglish auto-detect
+    LLM : Gemini Flash, thinking held to minimal because this is a live call
+    TTS : Cartesia Sonic, Mily's voice
+    """
+    stt = deepgram.STT(
+        model='nova-3',
+        language='multi',
+        smart_format=True,
+        interim_results=True,
+        # How long a pause before Mily assumes you finished. Tunable by feel
+        # without a code change; the old 300ms cut callers off mid-thought.
+        endpointing=int(os.getenv('MILY_SILENCE_MS', '500')),
     )
+
+    # No temperature / top_p / presence_penalty / frequency_penalty on purpose:
+    # Gemini 3.x reports these unsupported and some models reject the request
+    # outright. Call-to-call variety comes from CALL_ENERGY and OPENING_STYLE.
+    llm = google.LLM(
+        model=os.getenv('GEMINI_LLM_MODEL', DEFAULT_LLM_MODEL),
+        # Same construct the Gemini Live config used, so it is known to work
+        # against the installed google-genai. Minimal keeps replies quick.
+        thinking_config=types.ThinkingConfig(thinking_level='minimal'),
+    )
+
+    tts_model = os.getenv('CARTESIA_MODEL_ID', DEFAULT_TTS_MODEL)
+    tts = cartesia.TTS(
+        model=tts_model,
+        voice=os.getenv('CARTESIA_VOICE_ID', DEFAULT_VOICE_ID),
+        language=os.getenv('CARTESIA_LANGUAGE', DEFAULT_TTS_LANGUAGE),
+        # Nobody speaks at exactly one pace every day. Only sonic-3 takes a
+        # float; earlier sonic models accept the named presets only.
+        speed=round(random.uniform(0.96, 1.06), 2)
+        if tts_model.startswith('sonic-3') else 'normal',
+        # Cartesia documents word timestamps as unsupported outside
+        # en/de/es/fr, and Mily runs on 'hi'. Nothing here needs them: call
+        # memory stores LLM text, not TTS alignment.
+        word_timestamps=False,
+        # Emotion is deliberately unset. Cartesia documents it as experimental
+        # and unreliable outside voices tagged "Emotive"; sonic-3 already
+        # matches intonation to the emotional content of the transcript.
+    )
+
+    return dict(stt=stt, llm=llm, tts=tts)
+
+
+# Turn-taking tuning. Gemini Live handled this server-side; the pipeline does not,
+# so these decide whether Mily talks over the caller or leaves dead air.
+TURN_OPTIONS = {
+    # Let the caller trail off and pick their sentence back up without Mily
+    # jumping in, while still answering promptly once they are clearly done.
+    'min_endpointing_delay': float(os.getenv('MILY_MIN_ENDPOINT_S', '0.6')),
+    'max_endpointing_delay': 4.0,
+    # A stray "hmm" should not stop Mily mid-sentence; a real phrase should.
+    'min_interruption_duration': 0.4,
+    'min_interruption_words': 2,
+}
+
+
+def supported_turn_options() -> dict:
+    """Keep only turn options this installed version of AgentSession accepts.
+
+    LiveKit folded these flat kwargs into TurnHandlingOptions in 1.5.0 and marked
+    the old names deprecated, so the accepted set moves between releases. Passing
+    a name that has been removed raises TypeError, which would break every call.
+    Degrading to library defaults is much better than that.
+    """
+    accepted = inspect.signature(AgentSession.__init__).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()):
+        return dict(TURN_OPTIONS)
+    usable = {k: v for k, v in TURN_OPTIONS.items() if k in accepted}
+    dropped = sorted(set(TURN_OPTIONS) - set(usable))
+    if dropped:
+        log.warning('AgentSession does not accept %s; using library defaults for those',
+                    ', '.join(dropped))
+    return usable
 
 
 server = AgentServer(port=int(os.getenv('PORT', '8081')), num_idle_processes=1)
@@ -199,7 +310,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         await memory.close()
         ctx.shutdown(reason='Caller left during setup')
         return
-    session = AgentSession(llm=create_model())
+    pipeline = create_pipeline()
+    if VAD is not None:
+        pipeline['vad'] = VAD
+    session = AgentSession(**pipeline, **supported_turn_options())
     done = asyncio.Event()
 
     @ctx.room.on('participant_disconnected')

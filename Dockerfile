@@ -27,6 +27,15 @@ RUN useradd --create-home --shell /bin/bash app
 RUN chown -R app:app /app
 USER app
 
+# Bake the Silero VAD model into the image so the first call of a cold worker
+# does not pay the download. Runs as 'app' on purpose: the model cache lives in
+# the user's home, so downloading as root would leave it where app cannot read
+# it. Deliberately non-fatal — this is only a warm-up. If it fails the agent
+# fetches the model at startup, and load_vad() in agent.py already degrades to
+# STT-only endpointing rather than failing the call.
+RUN python agent.py download-files || \
+    echo "WARN: VAD model prewarm skipped; will be fetched at runtime"
+
 # Expose port for Railway
 EXPOSE 8080
 ENV PORT=8080

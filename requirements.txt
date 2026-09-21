@@ -1,4 +1,7 @@
 # Core dependencies for Mily voice agent.
-livekit-agents[google]==1.8.2
+# Pipeline: Deepgram STT -> Gemini LLM -> Cartesia TTS, with Silero VAD for
+# turn-taking. Gemini Live handled all four jobs in one model; splitting them
+# is what lets Mily use a chosen Cartesia voice instead of a prebuilt one.
+livekit-agents[google,deepgram,cartesia,silero]==1.8.2
 aiohttp==3.14.3
 python-dotenv==1.2.3
