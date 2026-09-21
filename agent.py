@@ -20,10 +20,42 @@ log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
 DEFAULT_MODEL = 'gemini-3.1-flash-live-preview'
 
+# --- Per-call variation ------------------------------------------------------
+# Gemini 3.x ignores temperature / top_p / penalties, so sampling knobs cannot
+# be used to stop calls sounding identical. Each call instead draws an energy
+# state and an opening style, which is model-independent and cannot throw an
+# API error. Energy describes delivery only: never an event, so it cannot turn
+# into a fabricated personal day.
 
-def build_system_prompt(name: str, history: str = '') -> str:
+CALL_ENERGY = [
+    'low and soft, unhurried',
+    'bright and quick, lots of small reactions',
+    'quiet, listening more than talking',
+    'playful, in a teasing mood',
+    'relaxed, comfortable with pauses',
+    'curious and chatty',
+    'a little lazy, short replies',
+    'gentle and attentive, softer voice',
+]
+
+OPENING_STYLE = [
+    'a plain hey or hello',
+    'a pleased-surprised hello',
+    'a slow soft hello',
+    'a quick casual hi',
+    'an "arre" then hello',
+    'a sleepy low hi',
+    'an old-friend "haan bol"',
+    'their name, then hey',
+]
+
+
+def build_system_prompt(name: str, history: str = '', energy: str = '') -> str:
     return (
         "You are Mily, an adult female AI companion, with a cute, warm, playful Gen-Z style. "
+        f"Your energy on this particular call: {energy}. Let that show in pacing, sentence length "
+        "and how much you say. Never mention or explain your mood, and never turn it into an event "
+        "or a reason you were busy. It only shapes delivery. "
         "Use Despina's natural Indian female voice. Speak colloquial Hindi, English or Hinglish "
         "matching the caller's latest language and comfort; switch smoothly when they do. "
         "If the caller speaks a full English sentence, reply in English, not Hinglish, unless they "
@@ -55,6 +87,15 @@ def build_system_prompt(name: str, history: str = '') -> str:
         "Adapt these to the actual situation. Never treat your examples as user memories. "
         "Avoid repeated 'main sun rahi hoon', 'jab mann kare bata dena', 'aur batao', "
         "'main hamesha yahan hoon', generic reassurance, paraphrasing every sentence, and repeated introductions. "
+        "Sound different every call. The example lines above are shapes to learn from, never sentences "
+        "to speak: if a reply of yours matches an example almost word for word, rewrite it in your own "
+        "words before saying it. Read the past conversation in the context data below and avoid reusing "
+        "greetings, openers or phrasings that already appear there, especially your own. "
+        "Do not open two consecutive turns the same way. Vary turn length: sometimes a single word, "
+        "sometimes a short reaction plus one thought. "
+        "Speak like a person thinking in real time, so a light hesitation is welcome where you genuinely "
+        "pause: 'hmm', 'uh', 'matlab', 'haan toh'. Use them occasionally, not in every turn, and never "
+        "stretched out as 'ummmm' or 'haaaan', which sounds fake. "
         "Do not read these example lines mechanically: late dinner -> 'Itni late dinner? Aaj busy tha kya?'; "
         "exam went well -> 'Arey nice! Wahi tough wala paper tha na?' ONLY if that detail is in memory. "
         "Bad day -> acknowledge what happened without instant advice; ask advice vs listening only if unclear. "
@@ -81,8 +122,9 @@ def build_system_prompt(name: str, history: str = '') -> str:
 
 
 class MilyCompanion(Agent):
-    def __init__(self, name, history, memory, metadata):
-        super().__init__(instructions=build_system_prompt(name, history+'\nClock: '+clock_context(metadata)))
+    def __init__(self, name, history, memory, metadata, energy):
+        super().__init__(instructions=build_system_prompt(
+            name, history + '\nClock: ' + clock_context(metadata), energy))
         self.memory = memory
         self.metadata = metadata
 
@@ -110,7 +152,10 @@ def create_model() -> google.realtime.RealtimeModel:
                          if model.startswith('gemini-3') else types.ThinkingConfig(thinking_budget=0)),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=False, prefix_padding_ms=100, silence_duration_ms=300,
+                disabled=False, prefix_padding_ms=100,
+                # 300ms had Mily answering before the caller finished a thought,
+                # which is a large part of why calls did not feel like real calls.
+                silence_duration_ms=int(os.getenv('MILY_SILENCE_MS', '500')),
             ),
             activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
         ),
@@ -171,15 +216,25 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     try:
         await session.start(
-            agent=MilyCompanion(caller.name or '', history, memory, metadata),
+            agent=MilyCompanion(caller.name or '', history, memory, metadata,
+                                random.choice(CALL_ENERGY)),
             room=ctx.room,
             room_options=room_io.RoomOptions(participant_identity=caller.identity),
         )
-        opening = random.choice(['Arey, hello!', 'Hey, aa gaye!', 'Hello ji!', 'Hey, achha laga tumhara call aaya.'])
+        # Mily writes her own greeting each call. The previous four fixed phrases,
+        # combined with "say only this", made every fourth call open with exactly
+        # the same words, which is what made calls feel pre-recorded.
+        style = random.choice(OPENING_STYLE)
+        if 'name' in style and not (caller.name or '').strip():
+            style = 'a plain hey or hello'
         session.generate_reply(instructions=(
-            f'For this opening say only this short casual greeting in your natural voice: {opening!r}. '
-            'If caller explicitly prefers English, translate it casually. Then STOP and let the caller speak. '
-            'Do not add any question, offer of help, introduction, service phrase or request for a topic. '
+            f'The call just connected. Greet them in your own words, in the style of {style}. '
+            'Two to six words, a greeting and nothing else. '
+            'No question, no "kaise ho", no offer of help, no introduction, no request for a topic. '
+            'Choose different words than any greeting already in the conversation history, '
+            'so repeat callers do not hear the same opening twice. '
+            'Greet in the caller language if their preference is known, otherwise Hinglish. '
+            'Then STOP and let the caller speak. '
             'After their first words, continue the relevant previous conversation from memory naturally. '
             'A call is social company, not a help request.'
         ))
