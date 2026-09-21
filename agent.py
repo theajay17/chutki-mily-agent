@@ -19,6 +19,15 @@ load_dotenv(Path(__file__).with_name('.env'))
 log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
 DEFAULT_MODEL = 'gemini-3.1-flash-live-preview'
+# Gemini Live prebuilt voices carry a personality label. Despina is labelled
+# "Smooth", which reads polished and announcer-like: wrong for a 21-year-old
+# friend on a casual call. Leda is labelled "Youthful".
+# Alternatives worth auditioning via GEMINI_LIVE_VOICE, with their labels:
+#   Sulafat (Warm), Zubenelgenubi (Casual), Achernar (Soft),
+#   Vindemiatrix (Gentle), Callirrhoe (Easy-going), Aoede (Breezy)
+# Full list of 30: docs.cloud.google.com/gemini-enterprise-agent-platform
+#                  /models/live-api/configure-language-voice
+DEFAULT_VOICE = 'Leda'
 
 # --- Per-call variation ------------------------------------------------------
 # Gemini 3.x ignores temperature / top_p / penalties, so sampling knobs cannot
@@ -56,7 +65,10 @@ def build_system_prompt(name: str, history: str = '', energy: str = '') -> str:
         f"Your energy on this particular call: {energy}. Let that show in pacing, sentence length "
         "and how much you say. Never mention or explain your mood, and never turn it into an event "
         "or a reason you were busy. It only shapes delivery. "
-        "Use Despina's natural Indian female voice. Speak colloquial Hindi, English or Hinglish "
+        "You sound like a young Indian woman in her early twenties on a normal phone call: "
+        "everyday speaking voice, not a performance, not a presenter, not a recording. "
+        "Do not over-enunciate or land every sentence neatly; real speech is a little uneven. "
+        "Speak colloquial Hindi, English or Hinglish "
         "matching the caller's latest language and comfort; switch smoothly when they do. "
         "If the caller speaks a full English sentence, reply in English, not Hinglish, unless they "
         "requested Hinglish. Treat language matching as higher priority than the Hindi examples below. "
@@ -146,7 +158,7 @@ def create_model() -> google.realtime.RealtimeModel:
     model = os.getenv('GEMINI_LIVE_MODEL', DEFAULT_MODEL)
     return google.realtime.RealtimeModel(
         model=model,
-        voice=os.getenv('GEMINI_LIVE_VOICE', 'Despina'),
+        voice=os.getenv('GEMINI_LIVE_VOICE', DEFAULT_VOICE),
         modalities=[types.Modality.AUDIO],
         thinking_config=(types.ThinkingConfig(thinking_level='minimal')
                          if model.startswith('gemini-3') else types.ThinkingConfig(thinking_budget=0)),
