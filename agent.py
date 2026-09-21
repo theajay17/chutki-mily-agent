@@ -32,18 +32,28 @@ DEFAULT_LLM_MODEL = 'gemini-3.5-flash'
 # natural thinking pace. sonic-2 reads them flatly, which sounds robotic.
 DEFAULT_TTS_MODEL = 'sonic-3'
 
-# Cartesia voice. This is "Anika - System Facilitator" (language hi).
-# Heads-up for whoever tunes this next: Cartesia describes Anika as presenting
-# "information with composed clarity, ideal for facilitating" — she is built as a
-# support/IVR persona, not a friend. If calls still feel like customer service,
-# the voice is a likely cause. Better-fitting Hindi female voices on this
-# account, with Cartesia's own descriptions:
-#   Siya - Bright Conversationalist  4459a9a5-69d6-4680-b970-e13dc51845b6
-#   Meera - Bright Companion         a81fccdc-5595-4dfc-ae76-4de6a515b8a2
-#   Sneha - Empathetic Voice         6b02ffe5-e3cb-48c0-a023-c72f85953375
-#   Esha - Calm Guide                72656902-fb4b-4c31-af52-c3b68e2cae26
+# Cartesia voice: "Siya - Bright Conversationalist" (language hi).
+#
+# Chosen to match the voice note on Mily's in-app profile, so the voice on a call
+# is the one users have already heard. Picked by measurement, not by label: the
+# same sentence was synthesized with every Hindi female voice on the account and
+# compared against assets/mily profile voice.wav.
+#
+#   profile note   pitch 246 Hz | spread 58.5 | bright 1528 Hz | 197 wpm
+#   Siya           pitch 253 Hz | spread 60.3 | bright 1711 Hz | 192 wpm
+#   Anika (before) pitch 292 Hz | spread 51.2 | bright 1492 Hz | 212 wpm
+#
+# Anika sat 46 Hz above the profile note, which is audible; Siya is within 7 Hz
+# with near-identical pitch variation and pace. Runners-up by distance were
+# Esha - Calm Guide (72656902-fb4b-4c31-af52-c3b68e2cae26) and
+# Lavanya - Friendly Assistant (c6bbc7d5-4b35-4d49-b1c6-4417019a61c1).
+#
+# A real clone of the profile clip would match better still, and Cartesia keeps
+# tone, accent, pacing and energy when cloning. It needs a paid plan: the clone
+# endpoint returns 402 plan_upgrade_required on the free tier.
+#
 # Override without touching code by setting CARTESIA_VOICE_ID.
-DEFAULT_VOICE_ID = '32b0f12b-67c3-421d-8850-b46c019ced91'
+DEFAULT_VOICE_ID = '4459a9a5-69d6-4680-b970-e13dc51845b6'
 
 # Anika is a Hindi-primary voice, so 'hi' is the right hint. If English words
 # inside Hinglish come out mispronounced, try CARTESIA_LANGUAGE=en and compare.
