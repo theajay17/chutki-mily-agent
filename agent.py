@@ -189,30 +189,57 @@ class MilyCompanion(Agent):
 
 
 
-def load_vad():
-    """Silero VAD, used for turn-taking and barge-in.
+# --- Silero VAD -------------------------------------------------------------
+# Used for turn-taking and barge-in. Gemini Live detected speech activity
+# server-side; this pipeline has no equivalent, so without VAD the session falls
+# back to Deepgram's endpointing alone and interruptions get clumsier.
+#
+# This must never be loaded at import time. LiveKit imports this module in every
+# worker subprocess, silero.VAD.load() has no timeout, and a stalled model
+# download therefore hangs the import: the worker never reports ready and
+# dispatched calls are simply never answered. A try/except cannot catch a hang.
+#
+# So: load in a background thread, never block a call on it, and cache per
+# process. The first call after a cold start uses STT endpointing, and every
+# call after that gets VAD.
 
-    Gemini Live detected speech activity server-side. This pipeline has no
-    equivalent, so without VAD the session falls back to Deepgram's endpointing
-    alone and interruptions get clumsy. Loading is best-effort: a missing plugin
-    or a failed model download degrades turn-taking instead of killing calls.
-    """
+_vad = None
+_vad_task: asyncio.Task | None = None
+_vad_broken = False
+
+
+def _load_vad_blocking():
+    from livekit.plugins import silero
+    return silero.VAD.load()
+
+
+async def _load_vad() -> None:
+    global _vad, _vad_broken
     try:
-        from livekit.plugins import silero
-    except ImportError:
-        log.warning('silero plugin missing; falling back to STT endpointing')
-        return None
-    try:
-        return silero.VAD.load()
+        _vad = await asyncio.wait_for(
+            asyncio.to_thread(_load_vad_blocking),
+            timeout=float(os.getenv('MILY_VAD_LOAD_TIMEOUT_S', '30')))
+        log.info('Silero VAD ready; turn detection will use VAD')
+    except (asyncio.TimeoutError, TimeoutError):
+        _vad_broken = True
+        log.warning('Silero VAD load timed out; staying on STT endpointing')
     except Exception as error:
-        log.warning('Silero VAD unavailable (%s); falling back to STT endpointing',
+        _vad_broken = True
+        log.warning('Silero VAD unavailable (%s); staying on STT endpointing',
                     type(error).__name__)
-        return None
 
 
-# Loaded once per worker process rather than per call: the model load is slow
-# enough to be noticeable on a first call.
-VAD = load_vad()
+def vad_if_ready():
+    """Return the VAD if it is already loaded, otherwise start loading it.
+
+    Deliberately never awaits the load, so no call ever pays for it.
+    """
+    global _vad_task
+    if _vad is not None or _vad_broken:
+        return _vad
+    if _vad_task is None or _vad_task.done():
+        _vad_task = asyncio.create_task(_load_vad())
+    return None
 
 
 def create_pipeline() -> dict:
@@ -321,8 +348,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         ctx.shutdown(reason='Caller left during setup')
         return
     pipeline = create_pipeline()
-    if VAD is not None:
-        pipeline['vad'] = VAD
+    vad = vad_if_ready()
+    if vad is not None:
+        pipeline['vad'] = vad
     session = AgentSession(**pipeline, **supported_turn_options())
     done = asyncio.Event()
 
