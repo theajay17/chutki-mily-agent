@@ -68,8 +68,13 @@ class CallMemory:
             return 'Memory unavailable. Do not invent memories or say they were saved.'
 
     def add(self, item):
-        text = item.text_content
-        if not self.worker or item.role not in ('user','assistant') or not text:
+        # conversation_item_added also fires for non-message items such as
+        # AgentHandoff, which have neither text_content nor role. Reading them
+        # as attributes raised AttributeError on every such event and lost the
+        # transcript write, so probe for them instead.
+        text = getattr(item, 'text_content', None)
+        role = getattr(item, 'role', None)
+        if not self.worker or role not in ('user', 'assistant') or not text:
             return
         row = {'id':str(uuid.uuid5(uuid.NAMESPACE_URL,self.uid+':'+item.id)),
             'firebase_uid':self.uid,'conversation_id':self.conversation,'role':item.role,

@@ -25,8 +25,23 @@ from livekit.plugins import cartesia, deepgram, google
 load_dotenv(Path(__file__).with_name('.env'))
 log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
-# Text LLM for the pipeline. gemini-2.0-flash was shut down 2026-06-01.
-DEFAULT_LLM_MODEL = 'gemini-3.5-flash'
+# Text LLM for the pipeline. gemini-2.0-flash was shut down 2026-06-01 and
+# gemini-2.5-flash now 404s for new users.
+#
+# Flash-Lite rather than Flash because Flash is a thinking model and is far too
+# slow to open a phone call. Measured on the real system prompt, asking only for
+# the short opening greeting:
+#
+#   gemini-3.5-flash       thinking=minimal    7.89 s
+#   gemini-3.5-flash       thinking=low        9.47 s
+#   gemini-3.5-flash       thinking=default   19.41 s
+#   gemini-3.5-flash-lite  thinking=minimal    1.15 s
+#
+# That 8 s was the silence callers heard at the start of every call. Mily's job
+# is short conversational turns, not reasoning, so the cheaper model is the right
+# fit as well as the faster one. Override with GEMINI_LLM_MODEL if replies start
+# ignoring the prompt's rules.
+DEFAULT_LLM_MODEL = 'gemini-3.5-flash-lite'
 
 # sonic-3 renders disfluencies written into the transcript ("hmm,", "uh,") with a
 # natural thinking pace. sonic-2 reads them flatly, which sounds robotic.
