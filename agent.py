@@ -1,14 +1,7 @@
-"""Mily: LiveKit voice agent — Deepgram STT, Gemini LLM, Cartesia TTS.
-
-Replaces Gemini Live speech-to-speech. Gemini Live only offers prebuilt voices,
-which sound identical on every call by design; Cartesia lets Mily use a chosen
-or cloned voice. The tradeoff is three network hops instead of one, so the
-latency and turn-taking settings below matter more than they used to.
-"""
+"""Mily: full-duplex LiveKit audio with Gemini Live speech-to-speech."""
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import json
 import random
@@ -20,62 +13,21 @@ from google.genai import types
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentServer, AgentSession, room_io, function_tool
 from call_context import CallMemory, clock_context
-from livekit.plugins import cartesia, deepgram, google
+from livekit.plugins import google
 
 load_dotenv(Path(__file__).with_name('.env'))
 log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
-# Published into the room on every call so it is possible to tell which build is
-# actually serving traffic. Bump when shipping something you need to confirm.
-BUILD_MARKER = '2026-09-22-flash-lite'
-# Text LLM for the pipeline. gemini-2.0-flash was shut down 2026-06-01 and
-# gemini-2.5-flash now 404s for new users.
-#
-# Flash-Lite rather than Flash because Flash is a thinking model and is far too
-# slow to open a phone call. Measured on the real system prompt, asking only for
-# the short opening greeting:
-#
-#   gemini-3.5-flash       thinking=minimal    7.89 s
-#   gemini-3.5-flash       thinking=low        9.47 s
-#   gemini-3.5-flash       thinking=default   19.41 s
-#   gemini-3.5-flash-lite  thinking=minimal    1.15 s
-#
-# That 8 s was the silence callers heard at the start of every call. Mily's job
-# is short conversational turns, not reasoning, so the cheaper model is the right
-# fit as well as the faster one. Override with GEMINI_LLM_MODEL if replies start
-# ignoring the prompt's rules.
-DEFAULT_LLM_MODEL = 'gemini-3.5-flash-lite'
-
-# sonic-3 renders disfluencies written into the transcript ("hmm,", "uh,") with a
-# natural thinking pace. sonic-2 reads them flatly, which sounds robotic.
-DEFAULT_TTS_MODEL = 'sonic-3'
-
-# Cartesia voice: "Siya - Bright Conversationalist" (language hi).
-#
-# Chosen to match the voice note on Mily's in-app profile, so the voice on a call
-# is the one users have already heard. Picked by measurement, not by label: the
-# same sentence was synthesized with every Hindi female voice on the account and
-# compared against assets/mily profile voice.wav.
-#
-#   profile note   pitch 246 Hz | spread 58.5 | bright 1528 Hz | 197 wpm
-#   Siya           pitch 253 Hz | spread 60.3 | bright 1711 Hz | 192 wpm
-#   Anika (before) pitch 292 Hz | spread 51.2 | bright 1492 Hz | 212 wpm
-#
-# Anika sat 46 Hz above the profile note, which is audible; Siya is within 7 Hz
-# with near-identical pitch variation and pace. Runners-up by distance were
-# Esha - Calm Guide (72656902-fb4b-4c31-af52-c3b68e2cae26) and
-# Lavanya - Friendly Assistant (c6bbc7d5-4b35-4d49-b1c6-4417019a61c1).
-#
-# A real clone of the profile clip would match better still, and Cartesia keeps
-# tone, accent, pacing and energy when cloning. It needs a paid plan: the clone
-# endpoint returns 402 plan_upgrade_required on the free tier.
-#
-# Override without touching code by setting CARTESIA_VOICE_ID.
-DEFAULT_VOICE_ID = '4459a9a5-69d6-4680-b970-e13dc51845b6'
-
-# Anika is a Hindi-primary voice, so 'hi' is the right hint. If English words
-# inside Hinglish come out mispronounced, try CARTESIA_LANGUAGE=en and compare.
-DEFAULT_TTS_LANGUAGE = 'hi'
+DEFAULT_MODEL = 'gemini-3.1-flash-live-preview'
+# Gemini Live prebuilt voices carry a personality label. Despina is labelled
+# "Smooth", which reads polished and announcer-like: wrong for a 21-year-old
+# friend on a casual call. Leda is labelled "Youthful".
+# Alternatives worth auditioning via GEMINI_LIVE_VOICE, with their labels:
+#   Sulafat (Warm), Zubenelgenubi (Casual), Achernar (Soft),
+#   Vindemiatrix (Gentle), Callirrhoe (Easy-going), Aoede (Breezy)
+# Full list of 30: docs.cloud.google.com/gemini-enterprise-agent-platform
+#                  /models/live-api/configure-language-voice
+DEFAULT_VOICE = 'Leda'
 
 # --- Per-call variation ------------------------------------------------------
 # Gemini 3.x ignores temperature / top_p / penalties, so sampling knobs cannot
@@ -177,11 +129,6 @@ def build_system_prompt(name: str, history: str = '', energy: str = '') -> str:
         "Never say 'main bhi chill kar rahi thi', 'tumhara intezaar kar rahi thi', or invent what you were "
         "doing before the call. Warmth comes from reacting to them, not a fabricated personal day. "
         "No markdown, emojis or spoken stage directions. "
-        "Your words go straight to a speech engine that takes its rhythm from your punctuation, "
-        "so write clean sentences: commas where you would breathe, and a full stop, question mark "
-        "or exclamation at the end of every sentence. "
-        "Use ordinary capitalisation. Never capitalise words for emphasis, because capitals get read "
-        "out as initials. Write numbers, times and amounts the normal way. "
         f"Caller display name (data): {name[:100]!r}. Context data:\n" + history
     )
 
@@ -207,200 +154,32 @@ class MilyCompanion(Agent):
 
 
 
-# --- Silero VAD -------------------------------------------------------------
-# Used for turn-taking and barge-in. Gemini Live detected speech activity
-# server-side; this pipeline has no equivalent, so without VAD the session falls
-# back to Deepgram's endpointing alone and interruptions get clumsier.
-#
-# This must never be loaded at import time. LiveKit imports this module in every
-# worker subprocess, silero.VAD.load() has no timeout, and a stalled model
-# download therefore hangs the import: the worker never reports ready and
-# dispatched calls are simply never answered. A try/except cannot catch a hang.
-#
-# So: load in a background thread, never block a call on it, and cache per
-# process. The first call after a cold start uses STT endpointing, and every
-# call after that gets VAD.
-
-_vad = None
-_vad_task: asyncio.Task | None = None
-_vad_broken = False
-
-
-def _load_vad_blocking():
-    from livekit.plugins import silero
-    return silero.VAD.load()
-
-
-async def _load_vad() -> None:
-    global _vad, _vad_broken
-    try:
-        _vad = await asyncio.wait_for(
-            asyncio.to_thread(_load_vad_blocking),
-            timeout=float(os.getenv('MILY_VAD_LOAD_TIMEOUT_S', '30')))
-        log.info('Silero VAD ready; turn detection will use VAD')
-    except (asyncio.TimeoutError, TimeoutError):
-        _vad_broken = True
-        log.warning('Silero VAD load timed out; staying on STT endpointing')
-    except Exception as error:
-        _vad_broken = True
-        log.warning('Silero VAD unavailable (%s); staying on STT endpointing',
-                    type(error).__name__)
-
-
-def vad_if_ready():
-    """Return the VAD if it is already loaded, otherwise start loading it.
-
-    Deliberately never awaits the load, so no call ever pays for it.
-    """
-    global _vad_task
-    if _vad is not None or _vad_broken:
-        return _vad
-    if _vad_task is None or _vad_task.done():
-        _vad_task = asyncio.create_task(_load_vad())
-    return None
-
-
-def supported(factory, **kwargs):
-    """Drop kwargs the installed version of a plugin does not accept.
-
-    These constructors take keyword-only arguments and no **kwargs, so one stale
-    name raises TypeError inside the job and the call dies silently a fraction of
-    a second after the agent joins. That is exactly how deepgram.STT(endpointing=)
-    broke every call: the parameter is endpointing_ms in livekit-plugins-deepgram
-    1.8.2, and the name had been copied from newer docs.
-
-    Losing one tuning knob is a far better failure than losing the call.
-    """
-    params = inspect.signature(factory).parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return kwargs
-    usable = {k: v for k, v in kwargs.items() if k in params}
-    dropped = sorted(set(kwargs) - set(usable))
-    if dropped:
-        log.warning('%s does not accept %s; using its defaults for those',
-                    getattr(factory, '__qualname__', factory), ', '.join(dropped))
-    return usable
-
-
-def create_pipeline() -> dict:
-    """STT, LLM and TTS components for the AgentSession.
-
-    STT : Deepgram Nova-3, multilingual so Hindi/English/Hinglish auto-detect
-    LLM : Gemini Flash, thinking held to minimal because this is a live call
-    TTS : Cartesia Sonic, Mily's voice
-    """
-    stt = deepgram.STT(**supported(
-        deepgram.STT,
-        model='nova-3',
-        language='multi',
-        smart_format=True,
-        interim_results=True,
-        # How long a pause before Mily assumes you finished. Tunable by feel
-        # without a code change; the old 300ms cut callers off mid-thought.
-        # Named endpointing_ms in this plugin, not endpointing.
-        endpointing_ms=int(os.getenv('MILY_SILENCE_MS', '500')),
-    ))
-
-    # No temperature / top_p / presence_penalty / frequency_penalty on purpose:
-    # Gemini 3.x reports these unsupported and some models reject the request
-    # outright. Call-to-call variety comes from CALL_ENERGY and OPENING_STYLE.
-    llm = google.LLM(**supported(
-        google.LLM,
-        model=os.getenv('GEMINI_LLM_MODEL', DEFAULT_LLM_MODEL),
-        # Same construct the Gemini Live config used, so it is known to work
-        # against the installed google-genai. Minimal keeps replies quick.
-        thinking_config=types.ThinkingConfig(thinking_level='minimal'),
-    ))
-
-    tts_model = os.getenv('CARTESIA_MODEL_ID', DEFAULT_TTS_MODEL)
-    tts = cartesia.TTS(**supported(
-        cartesia.TTS,
-        model=tts_model,
-        voice=os.getenv('CARTESIA_VOICE_ID', DEFAULT_VOICE_ID),
-        language=os.getenv('CARTESIA_LANGUAGE', DEFAULT_TTS_LANGUAGE),
-        # Nobody speaks at exactly one pace every day. Only sonic-3 takes a
-        # float; earlier sonic models accept the named presets only.
-        speed=round(random.uniform(0.96, 1.06), 2)
-        if tts_model.startswith('sonic-3') else 'normal',
-        # Cartesia documents word timestamps as unsupported outside
-        # en/de/es/fr, and Mily runs on 'hi'. Nothing here needs them: call
-        # memory stores LLM text, not TTS alignment.
-        word_timestamps=False,
-        # Emotion is deliberately unset. Cartesia documents it as experimental
-        # and unreliable outside voices tagged "Emotive"; sonic-3 already
-        # matches intonation to the emotional content of the transcript.
-    ))
-
-    return dict(stt=stt, llm=llm, tts=tts)
-
-
-# Turn-taking tuning. Gemini Live handled this server-side; the pipeline does not,
-# so these decide whether Mily talks over the caller or leaves dead air.
-TURN_OPTIONS = {
-    # Let the caller trail off and pick their sentence back up without Mily
-    # jumping in, while still answering promptly once they are clearly done.
-    'min_endpointing_delay': float(os.getenv('MILY_MIN_ENDPOINT_S', '0.6')),
-    'max_endpointing_delay': 4.0,
-    # A stray "hmm" should not stop Mily mid-sentence; a real phrase should.
-    'min_interruption_duration': 0.4,
-    'min_interruption_words': 2,
-}
-
-
-def supported_turn_options() -> dict:
-    """Keep only turn options this installed version of AgentSession accepts.
-
-    LiveKit folded these flat kwargs into TurnHandlingOptions in 1.5.0 and marked
-    the old names deprecated, so the accepted set moves between releases. Passing
-    a name that has been removed raises TypeError, which would break every call.
-    Degrading to library defaults is much better than that.
-    """
-    accepted = inspect.signature(AgentSession.__init__).parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()):
-        return dict(TURN_OPTIONS)
-    usable = {k: v for k, v in TURN_OPTIONS.items() if k in accepted}
-    dropped = sorted(set(TURN_OPTIONS) - set(usable))
-    if dropped:
-        log.warning('AgentSession does not accept %s; using library defaults for those',
-                    ', '.join(dropped))
-    return usable
+def create_model() -> google.realtime.RealtimeModel:
+    model = os.getenv('GEMINI_LIVE_MODEL', DEFAULT_MODEL)
+    return google.realtime.RealtimeModel(
+        model=model,
+        voice=os.getenv('GEMINI_LIVE_VOICE', DEFAULT_VOICE),
+        modalities=[types.Modality.AUDIO],
+        thinking_config=(types.ThinkingConfig(thinking_level='minimal')
+                         if model.startswith('gemini-3') else types.ThinkingConfig(thinking_budget=0)),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=False, prefix_padding_ms=100,
+                # 300ms had Mily answering before the caller finished a thought,
+                # which is a large part of why calls did not feel like real calls.
+                silence_duration_ms=int(os.getenv('MILY_SILENCE_MS', '500')),
+            ),
+            activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+        ),
+    )
 
 
 server = AgentServer(port=int(os.getenv('PORT', '8081')), num_idle_processes=1)
 
 
-async def announce(ctx: agents.JobContext, **attrs: str) -> None:
-    """Publish diagnostics as participant attributes.
-
-    A job that raises during setup just disconnects, so from the caller's side a
-    broken deploy and a healthy one look identical: the agent joins and leaves.
-    Surfacing the build marker and the error here makes the failure visible to
-    anything in the room, which is the only channel available without shell
-    access to the deployment. Best effort by design.
-    """
-    try:
-        await ctx.room.local_participant.set_attributes(
-            {k: str(v)[:480] for k, v in attrs.items()})
-    except Exception:
-        pass
-
-
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
-    await announce(ctx, mily_build=BUILD_MARKER)
-    try:
-        await handle_call(ctx)
-    except Exception as error:
-        log.exception('call setup failed')
-        await announce(ctx, mily_error=f'{type(error).__name__}: {error}')
-        # Give the attribute update a moment to reach the room before the job
-        # tears the connection down, or the report is lost with it.
-        await asyncio.sleep(1.5)
-        raise
-
-
-async def handle_call(ctx: agents.JobContext) -> None:
     try:
         caller = await asyncio.wait_for(ctx.wait_for_participant(
             kind=rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD), timeout=30)
@@ -420,11 +199,7 @@ async def handle_call(ctx: agents.JobContext) -> None:
         await memory.close()
         ctx.shutdown(reason='Caller left during setup')
         return
-    pipeline = create_pipeline()
-    vad = vad_if_ready()
-    if vad is not None:
-        pipeline['vad'] = vad
-    session = AgentSession(**pipeline, **supported_turn_options())
+    session = AgentSession(llm=create_model())
     done = asyncio.Event()
 
     @ctx.room.on('participant_disconnected')

@@ -27,19 +27,6 @@ RUN useradd --create-home --shell /bin/bash app
 RUN chown -R app:app /app
 USER app
 
-# Bake the Silero VAD model into the image so workers never fetch it at runtime.
-# Runs as 'app' on purpose: the cache lives in the user's home, so downloading as
-# root would leave it where app cannot read it.
-#
-# Loads the model directly rather than going through `agent.py download-files`,
-# because that only covers plugins the CLI knows how to prefetch.
-#
-# Non-fatal by design. agent.py loads the VAD lazily in a background thread with
-# a timeout and never blocks a call on it, so a cold image costs slightly worse
-# turn-taking on the first call instead of breaking calls.
-RUN python -c "from livekit.plugins import silero; silero.VAD.load()" || \
-    echo "WARN: VAD model not baked in; workers will fetch it in the background"
-
 # Expose port for Railway
 EXPOSE 8080
 ENV PORT=8080
