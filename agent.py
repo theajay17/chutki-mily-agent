@@ -242,6 +242,28 @@ def vad_if_ready():
     return None
 
 
+def supported(factory, **kwargs):
+    """Drop kwargs the installed version of a plugin does not accept.
+
+    These constructors take keyword-only arguments and no **kwargs, so one stale
+    name raises TypeError inside the job and the call dies silently a fraction of
+    a second after the agent joins. That is exactly how deepgram.STT(endpointing=)
+    broke every call: the parameter is endpointing_ms in livekit-plugins-deepgram
+    1.8.2, and the name had been copied from newer docs.
+
+    Losing one tuning knob is a far better failure than losing the call.
+    """
+    params = inspect.signature(factory).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    usable = {k: v for k, v in kwargs.items() if k in params}
+    dropped = sorted(set(kwargs) - set(usable))
+    if dropped:
+        log.warning('%s does not accept %s; using its defaults for those',
+                    getattr(factory, '__qualname__', factory), ', '.join(dropped))
+    return usable
+
+
 def create_pipeline() -> dict:
     """STT, LLM and TTS components for the AgentSession.
 
@@ -249,28 +271,32 @@ def create_pipeline() -> dict:
     LLM : Gemini Flash, thinking held to minimal because this is a live call
     TTS : Cartesia Sonic, Mily's voice
     """
-    stt = deepgram.STT(
+    stt = deepgram.STT(**supported(
+        deepgram.STT,
         model='nova-3',
         language='multi',
         smart_format=True,
         interim_results=True,
         # How long a pause before Mily assumes you finished. Tunable by feel
         # without a code change; the old 300ms cut callers off mid-thought.
-        endpointing=int(os.getenv('MILY_SILENCE_MS', '500')),
-    )
+        # Named endpointing_ms in this plugin, not endpointing.
+        endpointing_ms=int(os.getenv('MILY_SILENCE_MS', '500')),
+    ))
 
     # No temperature / top_p / presence_penalty / frequency_penalty on purpose:
     # Gemini 3.x reports these unsupported and some models reject the request
     # outright. Call-to-call variety comes from CALL_ENERGY and OPENING_STYLE.
-    llm = google.LLM(
+    llm = google.LLM(**supported(
+        google.LLM,
         model=os.getenv('GEMINI_LLM_MODEL', DEFAULT_LLM_MODEL),
         # Same construct the Gemini Live config used, so it is known to work
         # against the installed google-genai. Minimal keeps replies quick.
         thinking_config=types.ThinkingConfig(thinking_level='minimal'),
-    )
+    ))
 
     tts_model = os.getenv('CARTESIA_MODEL_ID', DEFAULT_TTS_MODEL)
-    tts = cartesia.TTS(
+    tts = cartesia.TTS(**supported(
+        cartesia.TTS,
         model=tts_model,
         voice=os.getenv('CARTESIA_VOICE_ID', DEFAULT_VOICE_ID),
         language=os.getenv('CARTESIA_LANGUAGE', DEFAULT_TTS_LANGUAGE),
@@ -285,7 +311,7 @@ def create_pipeline() -> dict:
         # Emotion is deliberately unset. Cartesia documents it as experimental
         # and unreliable outside voices tagged "Emotive"; sonic-3 already
         # matches intonation to the emotional content of the transcript.
-    )
+    ))
 
     return dict(stt=stt, llm=llm, tts=tts)
 
