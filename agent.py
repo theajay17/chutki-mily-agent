@@ -25,6 +25,9 @@ from livekit.plugins import cartesia, deepgram, google
 load_dotenv(Path(__file__).with_name('.env'))
 log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
+# Published into the room on every call so it is possible to tell which build is
+# actually serving traffic. Bump when shipping something you need to confirm.
+BUILD_MARKER = '2026-09-22-flash-lite'
 # Text LLM for the pipeline. gemini-2.0-flash was shut down 2026-06-01 and
 # gemini-2.5-flash now 404s for new users.
 #
@@ -366,9 +369,38 @@ def supported_turn_options() -> dict:
 server = AgentServer(port=int(os.getenv('PORT', '8081')), num_idle_processes=1)
 
 
+async def announce(ctx: agents.JobContext, **attrs: str) -> None:
+    """Publish diagnostics as participant attributes.
+
+    A job that raises during setup just disconnects, so from the caller's side a
+    broken deploy and a healthy one look identical: the agent joins and leaves.
+    Surfacing the build marker and the error here makes the failure visible to
+    anything in the room, which is the only channel available without shell
+    access to the deployment. Best effort by design.
+    """
+    try:
+        await ctx.room.local_participant.set_attributes(
+            {k: str(v)[:480] for k, v in attrs.items()})
+    except Exception:
+        pass
+
+
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
+    await announce(ctx, mily_build=BUILD_MARKER)
+    try:
+        await handle_call(ctx)
+    except Exception as error:
+        log.exception('call setup failed')
+        await announce(ctx, mily_error=f'{type(error).__name__}: {error}')
+        # Give the attribute update a moment to reach the room before the job
+        # tears the connection down, or the report is lost with it.
+        await asyncio.sleep(1.5)
+        raise
+
+
+async def handle_call(ctx: agents.JobContext) -> None:
     try:
         caller = await asyncio.wait_for(ctx.wait_for_participant(
             kind=rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD), timeout=30)
