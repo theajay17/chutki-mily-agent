@@ -18,58 +18,13 @@ from livekit.plugins import google
 load_dotenv(Path(__file__).with_name('.env'))
 log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
-BUILD_MARKER = '2026-09-22-gemini-live-rollback'
 DEFAULT_MODEL = 'gemini-3.1-flash-live-preview'
-# Gemini Live prebuilt voices carry a personality label. Despina is labelled
-# "Smooth", which reads polished and announcer-like: wrong for a 21-year-old
-# friend on a casual call. Leda is labelled "Youthful".
-# Alternatives worth auditioning via GEMINI_LIVE_VOICE, with their labels:
-#   Sulafat (Warm), Zubenelgenubi (Casual), Achernar (Soft),
-#   Vindemiatrix (Gentle), Callirrhoe (Easy-going), Aoede (Breezy)
-# Full list of 30: docs.cloud.google.com/gemini-enterprise-agent-platform
-#                  /models/live-api/configure-language-voice
-DEFAULT_VOICE = 'Leda'
-
-# --- Per-call variation ------------------------------------------------------
-# Gemini 3.x ignores temperature / top_p / penalties, so sampling knobs cannot
-# be used to stop calls sounding identical. Each call instead draws an energy
-# state and an opening style, which is model-independent and cannot throw an
-# API error. Energy describes delivery only: never an event, so it cannot turn
-# into a fabricated personal day.
-
-CALL_ENERGY = [
-    'low and soft, unhurried',
-    'bright and quick, lots of small reactions',
-    'quiet, listening more than talking',
-    'playful, in a teasing mood',
-    'relaxed, comfortable with pauses',
-    'curious and chatty',
-    'a little lazy, short replies',
-    'gentle and attentive, softer voice',
-]
-
-OPENING_STYLE = [
-    'a plain hey or hello',
-    'a pleased-surprised hello',
-    'a slow soft hello',
-    'a quick casual hi',
-    'an "arre" then hello',
-    'a sleepy low hi',
-    'an old-friend "haan bol"',
-    'their name, then hey',
-]
 
 
-def build_system_prompt(name: str, history: str = '', energy: str = '') -> str:
+def build_system_prompt(name: str, history: str = '') -> str:
     return (
         "You are Mily, an adult female AI companion, with a cute, warm, playful Gen-Z style. "
-        f"Your energy on this particular call: {energy}. Let that show in pacing, sentence length "
-        "and how much you say. Never mention or explain your mood, and never turn it into an event "
-        "or a reason you were busy. It only shapes delivery. "
-        "You sound like a young Indian woman in her early twenties on a normal phone call: "
-        "everyday speaking voice, not a performance, not a presenter, not a recording. "
-        "Do not over-enunciate or land every sentence neatly; real speech is a little uneven. "
-        "Speak colloquial Hindi, English or Hinglish "
+        "Use Despina's natural Indian female voice. Speak colloquial Hindi, English or Hinglish "
         "matching the caller's latest language and comfort; switch smoothly when they do. "
         "If the caller speaks a full English sentence, reply in English, not Hinglish, unless they "
         "requested Hinglish. Treat language matching as higher priority than the Hindi examples below. "
@@ -100,15 +55,6 @@ def build_system_prompt(name: str, history: str = '', energy: str = '') -> str:
         "Adapt these to the actual situation. Never treat your examples as user memories. "
         "Avoid repeated 'main sun rahi hoon', 'jab mann kare bata dena', 'aur batao', "
         "'main hamesha yahan hoon', generic reassurance, paraphrasing every sentence, and repeated introductions. "
-        "Sound different every call. The example lines above are shapes to learn from, never sentences "
-        "to speak: if a reply of yours matches an example almost word for word, rewrite it in your own "
-        "words before saying it. Read the past conversation in the context data below and avoid reusing "
-        "greetings, openers or phrasings that already appear there, especially your own. "
-        "Do not open two consecutive turns the same way. Vary turn length: sometimes a single word, "
-        "sometimes a short reaction plus one thought. "
-        "Speak like a person thinking in real time, so a light hesitation is welcome where you genuinely "
-        "pause: 'hmm', 'uh', 'matlab', 'haan toh'. Use them occasionally, not in every turn, and never "
-        "stretched out as 'ummmm' or 'haaaan', which sounds fake. "
         "Do not read these example lines mechanically: late dinner -> 'Itni late dinner? Aaj busy tha kya?'; "
         "exam went well -> 'Arey nice! Wahi tough wala paper tha na?' ONLY if that detail is in memory. "
         "Bad day -> acknowledge what happened without instant advice; ask advice vs listening only if unclear. "
@@ -135,9 +81,8 @@ def build_system_prompt(name: str, history: str = '', energy: str = '') -> str:
 
 
 class MilyCompanion(Agent):
-    def __init__(self, name, history, memory, metadata, energy):
-        super().__init__(instructions=build_system_prompt(
-            name, history + '\nClock: ' + clock_context(metadata), energy))
+    def __init__(self, name, history, memory, metadata):
+        super().__init__(instructions=build_system_prompt(name, history+'\nClock: '+clock_context(metadata)))
         self.memory = memory
         self.metadata = metadata
 
@@ -159,16 +104,13 @@ def create_model() -> google.realtime.RealtimeModel:
     model = os.getenv('GEMINI_LIVE_MODEL', DEFAULT_MODEL)
     return google.realtime.RealtimeModel(
         model=model,
-        voice=os.getenv('GEMINI_LIVE_VOICE', DEFAULT_VOICE),
+        voice=os.getenv('GEMINI_LIVE_VOICE', 'Despina'),
         modalities=[types.Modality.AUDIO],
         thinking_config=(types.ThinkingConfig(thinking_level='minimal')
                          if model.startswith('gemini-3') else types.ThinkingConfig(thinking_budget=0)),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=False, prefix_padding_ms=100,
-                # 300ms had Mily answering before the caller finished a thought,
-                # which is a large part of why calls did not feel like real calls.
-                silence_duration_ms=int(os.getenv('MILY_SILENCE_MS', '500')),
+                disabled=False, prefix_padding_ms=100, silence_duration_ms=300,
             ),
             activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
         ),
@@ -178,29 +120,9 @@ def create_model() -> google.realtime.RealtimeModel:
 server = AgentServer(port=int(os.getenv('PORT', '8081')), num_idle_processes=1)
 
 
-async def announce(ctx: agents.JobContext, **attrs: str) -> None:
-    """Publish the serving build and setup errors into the LiveKit room."""
-    try:
-        await ctx.room.local_participant.set_attributes(
-            {key: str(value)[:480] for key, value in attrs.items()})
-    except Exception:
-        pass
-
-
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
-    await announce(ctx, mily_build=BUILD_MARKER)
-    try:
-        await handle_call(ctx)
-    except Exception as error:
-        log.exception('Gemini Live call setup failed')
-        await announce(ctx, mily_error=f'{type(error).__name__}: {error}')
-        await asyncio.sleep(1.5)
-        raise
-
-
-async def handle_call(ctx: agents.JobContext) -> None:
     try:
         caller = await asyncio.wait_for(ctx.wait_for_participant(
             kind=rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD), timeout=30)
@@ -249,25 +171,15 @@ async def handle_call(ctx: agents.JobContext) -> None:
 
     try:
         await session.start(
-            agent=MilyCompanion(caller.name or '', history, memory, metadata,
-                                random.choice(CALL_ENERGY)),
+            agent=MilyCompanion(caller.name or '', history, memory, metadata),
             room=ctx.room,
             room_options=room_io.RoomOptions(participant_identity=caller.identity),
         )
-        # Mily writes her own greeting each call. The previous four fixed phrases,
-        # combined with "say only this", made every fourth call open with exactly
-        # the same words, which is what made calls feel pre-recorded.
-        style = random.choice(OPENING_STYLE)
-        if 'name' in style and not (caller.name or '').strip():
-            style = 'a plain hey or hello'
+        opening = random.choice(['Arey, hello!', 'Hey, aa gaye!', 'Hello ji!', 'Hey, achha laga tumhara call aaya.'])
         session.generate_reply(instructions=(
-            f'The call just connected. Greet them in your own words, in the style of {style}. '
-            'Two to six words, a greeting and nothing else. '
-            'No question, no "kaise ho", no offer of help, no introduction, no request for a topic. '
-            'Choose different words than any greeting already in the conversation history, '
-            'so repeat callers do not hear the same opening twice. '
-            'Greet in the caller language if their preference is known, otherwise Hinglish. '
-            'Then STOP and let the caller speak. '
+            f'For this opening say only this short casual greeting in your natural voice: {opening!r}. '
+            'If caller explicitly prefers English, translate it casually. Then STOP and let the caller speak. '
+            'Do not add any question, offer of help, introduction, service phrase or request for a topic. '
             'After their first words, continue the relevant previous conversation from memory naturally. '
             'A call is social company, not a help request.'
         ))
