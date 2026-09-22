@@ -18,6 +18,7 @@ from livekit.plugins import google
 load_dotenv(Path(__file__).with_name('.env'))
 log = logging.getLogger('mily-agent')
 AGENT_NAME = os.getenv('MILY_AGENT_NAME', 'mily-voice-agent')
+BUILD_MARKER = '2026-09-22-gemini-live-rollback'
 DEFAULT_MODEL = 'gemini-3.1-flash-live-preview'
 # Gemini Live prebuilt voices carry a personality label. Despina is labelled
 # "Smooth", which reads polished and announcer-like: wrong for a 21-year-old
@@ -177,9 +178,29 @@ def create_model() -> google.realtime.RealtimeModel:
 server = AgentServer(port=int(os.getenv('PORT', '8081')), num_idle_processes=1)
 
 
+async def announce(ctx: agents.JobContext, **attrs: str) -> None:
+    """Publish the serving build and setup errors into the LiveKit room."""
+    try:
+        await ctx.room.local_participant.set_attributes(
+            {key: str(value)[:480] for key, value in attrs.items()})
+    except Exception:
+        pass
+
+
 @server.rtc_session(agent_name=AGENT_NAME)
 async def entrypoint(ctx: agents.JobContext) -> None:
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
+    await announce(ctx, mily_build=BUILD_MARKER)
+    try:
+        await handle_call(ctx)
+    except Exception as error:
+        log.exception('Gemini Live call setup failed')
+        await announce(ctx, mily_error=f'{type(error).__name__}: {error}')
+        await asyncio.sleep(1.5)
+        raise
+
+
+async def handle_call(ctx: agents.JobContext) -> None:
     try:
         caller = await asyncio.wait_for(ctx.wait_for_participant(
             kind=rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD), timeout=30)
